@@ -1160,6 +1160,10 @@
 				power-domains = <&k3_pds 244 TI_SCI_PD_EXCLUSIVE>; /* OLDI1_VD */
 			};
 		};
+
+		dss0_ports: ports {
+
+		};
 	};
 
 	dss1: dss@30220000 {
