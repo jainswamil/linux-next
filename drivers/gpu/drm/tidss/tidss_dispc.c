@@ -448,6 +448,11 @@ const struct dispc_features dispc_am62l_feats = {
 
 static const u16 *dispc_common_regmap;
 
+struct tidss_dpi_clk_ctrl {
+	struct regmap *regmap;
+	u32 offset;  /* Offset to add to register addresses for new DT format */
+};
+
 struct dss_vp_data {
 	u32 *gamma_table;
 	bool dpi_output;
@@ -469,7 +474,7 @@ struct dispc_device {
 	const struct dispc_features *feat;
 
 	struct clk *fclk;
-	struct regmap *syscon_dpi_io_ctrl;
+	struct tidss_dpi_clk_ctrl *syscon_dpi_clk_ctrl;
 
 	bool is_enabled;
 
@@ -536,6 +541,13 @@ static u32 dispc_vp_read(struct dispc_device *dispc, u32 hw_videoport, u16 reg)
 	void __iomem *base = dispc->base_vp[hw_videoport];
 
 	return ioread32(base + reg);
+}
+
+static void dispc_dpi_regmap_write(struct dispc_device *dispc, u32 reg, u32 val)
+{
+	if (dispc->syscon_dpi_clk_ctrl)
+		regmap_write(dispc->syscon_dpi_clk_ctrl->regmap,
+			     reg + dispc->syscon_dpi_clk_ctrl->offset, val);
 }
 
 int tidss_configure_oldi(struct tidss_device *tidss, u32 hw_videoport,
@@ -1205,10 +1217,10 @@ void dispc_vp_prepare(struct dispc_device *dispc, u32 hw_videoport,
 		       FIELD_PREP(DISPC_VP_SIZE_SCREEN_VDISPLAY_MASK,
 				  mode->crtc_vdisplay - 1));
 
-	if (dispc->vp_data[hw_videoport].dpi_output && dispc->syscon_dpi_io_ctrl) {
-		regmap_write(dispc->syscon_dpi_io_ctrl, 0x0,
-			     (!ipc ? DPI0_CLK_CTRL_DATA_CLK_INVDIS : 0) |
-			     (rf ? DPI0_CLK_CTRL_SYNC_CLK_INVDIS : 0));
+	if (dispc->vp_data[hw_videoport].dpi_output && dispc->syscon_dpi_clk_ctrl) {
+		dispc_dpi_regmap_write(dispc, 0x0,
+				       (!ipc ? DPI0_CLK_CTRL_DATA_CLK_INVDIS : 0) |
+				       (rf ? DPI0_CLK_CTRL_SYNC_CLK_INVDIS : 0));
 	}
 }
 
@@ -2902,6 +2914,102 @@ static void dispc_init_errata(struct dispc_device *dispc)
 	}
 }
 
+/**
+ * get_dpi_clk_ctrl_regmap - Get DPI clock control regmap with backward compatibility
+ * @dev: Device pointer for DSS
+ *
+ * This function provides backward compatibility for DPI clock control register access.
+ *
+ * New DT format:
+ *   ti,dpi0-clk-ctrl = <&main_conf 0x8300 0x4>;
+ *   Where main_conf is the main configuration bus, 0x8300 is the offset of DPI
+ *   clock control registers within main_conf, and 0x4 is the size.
+ *
+ * Return: Pointer to tidss_dpi_clk_ctrl structure on success, ERR_PTR on failure,
+ *         and NULL if not available
+ */
+static struct tidss_dpi_clk_ctrl *get_dpi_clk_ctrl_regmap(struct device *dev)
+{
+	struct tidss_dpi_clk_ctrl *dpi_ctrl;
+	struct regmap *regmap;
+	struct device_node *main_conf_node;
+	u32 offset = 0, size;
+	int ret;
+
+	dpi_ctrl = devm_kzalloc(dev, sizeof(*dpi_ctrl), GFP_KERNEL);
+	if (!dpi_ctrl)
+		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * First try the legacy approach: syscon_regmap_lookup_by_compatible
+	 * This maintains backward compatibility with existing DT
+	 */
+	regmap = syscon_regmap_lookup_by_compatible("ti,am625-dss-dpi0-clk-ctrl");
+	if (!IS_ERR(regmap)) {
+		dpi_ctrl->regmap = regmap;
+		dpi_ctrl->offset = 0;  /* No offset needed for legacy format */
+		return dpi_ctrl;
+	}
+
+	/* Store the legacy error for potential fallback */
+	if (PTR_ERR(regmap) == -ENODEV) {
+		devm_kfree(dev, dpi_ctrl);
+		return NULL;
+	}
+
+	/*
+	 * New approach: "ti,dpi0-clk-ctrl" property contains main_conf phandle,
+	 * offset, and size. Parse the property as: <&main_conf offset size>
+	 */
+	ret = of_property_read_u32_index(dev->of_node, "ti,dpi0-clk-ctrl", 1, &offset);
+	if (ret) {
+		/* If we can't read offset, fall back to legacy error or NULL */
+		if (PTR_ERR(regmap) != -ENODEV) {
+			devm_kfree(dev, dpi_ctrl);
+			return ERR_CAST(regmap);
+		}
+		devm_kfree(dev, dpi_ctrl);
+		return NULL;
+	}
+
+	ret = of_property_read_u32_index(dev->of_node, "ti,dpi0-clk-ctrl", 2, &size);
+	if (ret) {
+		/* If we can't read size, fall back to legacy error or NULL */
+		if (PTR_ERR(regmap) != -ENODEV) {
+			devm_kfree(dev, dpi_ctrl);
+			return ERR_CAST(regmap);
+		}
+		devm_kfree(dev, dpi_ctrl);
+		return NULL;
+	}
+
+	/* Get the main_conf node from the first element of the property */
+	main_conf_node = of_parse_phandle(dev->of_node, "ti,dpi0-clk-ctrl", 0);
+	if (!main_conf_node) {
+		/* If we can't get main_conf node, fall back to legacy error or NULL */
+		if (PTR_ERR(regmap) != -ENODEV) {
+			devm_kfree(dev, dpi_ctrl);
+			return ERR_CAST(regmap);
+		}
+		devm_kfree(dev, dpi_ctrl);
+		return NULL;
+	}
+
+	/* Get regmap for main_conf node */
+	regmap = syscon_node_to_regmap(main_conf_node);
+	of_node_put(main_conf_node);
+
+	if (IS_ERR(regmap)) {
+		devm_kfree(dev, dpi_ctrl);
+		return ERR_CAST(regmap);
+	}
+
+	dpi_ctrl->regmap = regmap;
+	dpi_ctrl->offset = offset;
+
+	return dpi_ctrl;
+}
+
 /*
  * K2G display controller does not support soft reset, so we do a basic manual
  * reset here: make sure the IRQs are masked and VPs are disabled.
@@ -3015,16 +3123,13 @@ int dispc_init(struct tidss_device *tidss)
 
 	dispc_init_errata(dispc);
 
-	dispc->syscon_dpi_io_ctrl = syscon_regmap_lookup_by_compatible("ti,am625-dss-dpi0-clk-ctrl");
-	if (IS_ERR(dispc->syscon_dpi_io_ctrl)) {
-		if (PTR_ERR(dispc->syscon_dpi_io_ctrl) != -ENODEV) {
-			r = dev_err_probe(dispc->dev, PTR_ERR(dispc->syscon_dpi_io_ctrl),
-					  "DISPC: syscon_regmap_lookup_by_phandle failed.\n");
-			return r;
-		}
-
-		dispc->syscon_dpi_io_ctrl = NULL;
+	dispc->syscon_dpi_clk_ctrl = get_dpi_clk_ctrl_regmap(dev);
+	if (IS_ERR(dispc->syscon_dpi_clk_ctrl)) {
+		r = dev_err_probe(dispc->dev, PTR_ERR(dispc->syscon_dpi_clk_ctrl),
+				  "DISPC: Failed to get DPI IO control regmap.\n");
+		return r;
 	}
+	/* syscon_dpi_clk_ctrl can be NULL on platforms that don't need it */
 
 	dispc->fourccs = devm_kcalloc(dev, ARRAY_SIZE(dispc_color_formats),
 				      sizeof(*dispc->fourccs), GFP_KERNEL);

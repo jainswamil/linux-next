@@ -24,6 +24,11 @@
 
 static DEFINE_IDA(tidss_oldi_ida);
 
+struct tidss_oldi_io_ctrl {
+	struct regmap *regmap;
+	u32 offset;  /* Offset to add to register addresses for new DT format */
+};
+
 struct tidss_oldi_platform_data {
 	struct tidss_device *tidss;
 };
@@ -42,7 +47,7 @@ struct tidss_oldi {
 	u32 parent_vp;
 
 	struct clk *serial;
-	struct regmap *io_ctrl;
+	struct tidss_oldi_io_ctrl *io_ctrl;
 };
 
 struct oldi_bus_format {
@@ -116,6 +121,23 @@ tidss_oldi_set_serial_clk(struct tidss_oldi *oldi, unsigned long rate)
 	return 0;
 }
 
+static void tidss_oldi_regmap_update_bits(struct tidss_oldi *oldi, u32 reg, u32 mask, u32 val)
+{
+	u32 final_reg;
+
+	if (!oldi->io_ctrl || !oldi->io_ctrl->regmap) {
+		dev_err(oldi->dev, "OLDI%u: IO control regmap not available\n",
+			oldi->oldi_instance);
+		return;
+	}
+
+	final_reg = reg + oldi->io_ctrl->offset;
+	dev_dbg(oldi->dev, "OLDI%u: regmap_update_bits reg=0x%x offset=0x%x final=0x%x mask=0x%x val=0x%x\n",
+		oldi->oldi_instance, reg, oldi->io_ctrl->offset, final_reg, mask, val);
+
+	regmap_update_bits(oldi->io_ctrl->regmap, final_reg, mask, val);
+}
+
 static void tidss_oldi_tx_power(struct tidss_oldi *oldi, bool enable)
 {
 	u32 mask;
@@ -169,7 +191,7 @@ static void tidss_oldi_tx_power(struct tidss_oldi *oldi, bool enable)
 		}
 	}
 
-	regmap_update_bits(oldi->io_ctrl, OLDI_PD_CTRL, mask, enable ? 0 : mask);
+	tidss_oldi_regmap_update_bits(oldi, OLDI_PD_CTRL, mask, enable ? 0 : mask);
 }
 
 static int tidss_oldi_config(struct tidss_oldi *oldi,
@@ -255,11 +277,17 @@ static void tidss_oldi_atomic_pre_enable(struct drm_bridge *bridge,
 	struct drm_crtc_state *crtc_state;
 	struct drm_display_mode *mode;
 	struct drm_bridge_state *bridge_state;
+	int ret;
 
 	if (oldi->link_type == OLDI_MODE_SECONDARY_CLONE_SINGLE_LINK)
 		return;
 
-	WARN_ON(pm_runtime_get_sync(oldi->dev));
+	ret = pm_runtime_get_sync(oldi->dev);
+	if (ret < 0) {
+		dev_err(oldi->dev, "OLDI%u: Failed to enable device: %d\n",
+			oldi->oldi_instance, ret);
+		return;
+	}
 
 	connector = drm_atomic_get_new_connector_for_encoder(state,
 							     bridge->encoder);
@@ -452,6 +480,120 @@ static int get_oldi_mode(struct device_node *oldi_tx, int *companion_instance)
 	}
 }
 
+/**
+ * get_oldi_io_ctrl_regmap - Get OLDI IO control regmap with backward compatibility
+ * @oldi_tx: Device node for OLDI transmitter
+ *
+ * This function provides backward compatibility for OLDI IO control register access.
+ *
+ * Legacy device tree format:
+ *   ti,oldi-io-ctrl = <&dss_oldi_io_ctrl>;
+ *   Where dss_oldi_io_ctrl is a separate syscon node for OLDI IO control registers.
+ *
+ * New device tree format:
+ *   ti,oldi-io-ctrl = <&main_conf 0x8600 0x200>;
+ *   Where main_conf is the main configuration bus, 0x8600 is the offset of OLDI
+ *   IO control registers within main_conf, and 0x200 is the size.
+ *
+ * The function first attempts the legacy approach, and if that fails, parses the
+ * new format. For the new format, it stores the offset so that register accesses
+ * can be adjusted appropriately.
+ *
+ * Return: Pointer to tidss_oldi_io_ctrl structure on success, ERR_PTR on failure.
+ */
+static struct tidss_oldi_io_ctrl *get_oldi_io_ctrl_regmap(struct device *dev, struct device_node *oldi_tx)
+{
+	struct tidss_oldi_io_ctrl *io_ctrl;
+	struct regmap *regmap;
+	struct device_node *main_conf_node;
+	u32 offset = 0, size;
+	int ret;
+
+	io_ctrl = devm_kzalloc(dev, sizeof(*io_ctrl), GFP_KERNEL);
+	if (!io_ctrl)
+		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * Check the format of the ti,oldi-io-ctrl property first.
+	 * Legacy format: <&dss_oldi_io_ctrl> (1 element)
+	 * New format: <&main_conf 0x8600 0x200> (3 elements)
+	 */
+	ret = of_property_count_u32_elems(oldi_tx, "ti,oldi-io-ctrl");
+	if (ret == 1) {
+		/* Legacy format: single phandle to dedicated syscon */
+		regmap = syscon_regmap_lookup_by_phandle(oldi_tx, "ti,oldi-io-ctrl");
+		if (!IS_ERR(regmap)) {
+			io_ctrl->regmap = regmap;
+			io_ctrl->offset = 0;  /* No offset needed for legacy format */
+			dev_info(dev, "OLDI: Using legacy DT format with direct syscon reference\n");
+			return io_ctrl;
+		}
+		dev_err(dev, "OLDI: Legacy syscon lookup failed: %ld\n", PTR_ERR(regmap));
+		return ERR_CAST(regmap);
+	} else if (ret == 3) {
+		/* New format: <&main_conf offset size> */
+		dev_info(dev, "OLDI: Detected new DT format with 3 elements\n");
+	} else {
+		dev_err(dev, "OLDI: ti,oldi-io-ctrl property should have 1 or 3 elements, found %d\n", ret);
+		return ERR_PTR(-EINVAL);
+	}
+
+	dev_info(dev, "OLDI: Legacy syscon lookup failed (%ld), trying new DT format\n", PTR_ERR(regmap));
+
+	/*
+	 * New approach: "ti,oldi-io-ctrl" property contains main_conf phandle,
+	 * offset, and size. Parse the property as: <&main_conf offset size>
+	 */
+
+	/* First verify the property has the expected number of elements */
+	ret = of_property_count_u32_elems(oldi_tx, "ti,oldi-io-ctrl");
+	if (ret != 3) {
+		dev_err(dev, "OLDI: ti,oldi-io-ctrl property should have 3 elements, found %d\n", ret);
+		return ERR_CAST(regmap);
+	}
+	ret = of_property_read_u32_index(oldi_tx, "ti,oldi-io-ctrl", 1, &offset);
+	if (ret) {
+		dev_err(dev, "OLDI: Failed to read offset from new DT format: %d\n", ret);
+		return ERR_PTR(ret);
+	}
+
+	ret = of_property_read_u32_index(oldi_tx, "ti,oldi-io-ctrl", 2, &size);
+	if (ret) {
+		dev_err(dev, "OLDI: Failed to read size from new DT format: %d\n", ret);
+		return ERR_PTR(ret);
+	}
+
+	dev_info(dev, "OLDI: Parsed new DT format - offset=0x%x, size=0x%x\n", offset, size);
+
+	/* Get the main_conf node from the first element of the property */
+	main_conf_node = of_parse_phandle(oldi_tx, "ti,oldi-io-ctrl", 0);
+	if (!main_conf_node) {
+		dev_err(dev, "OLDI: Failed to parse main_conf phandle from new DT format\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	dev_info(dev, "OLDI: Successfully parsed main_conf phandle: %pOF\n", main_conf_node);
+
+	/* Get regmap for main_conf node */
+	regmap = syscon_node_to_regmap(main_conf_node);
+	of_node_put(main_conf_node);
+
+	if (IS_ERR(regmap)) {
+		dev_err(dev, "OLDI: Failed to get main_conf regmap: %ld\n", PTR_ERR(regmap));
+		return ERR_CAST(regmap);
+	}
+
+	dev_info(dev, "OLDI: Successfully got main_conf regmap\n");
+
+	io_ctrl->regmap = regmap;
+	io_ctrl->offset = offset;
+
+	dev_info(dev, "OLDI: Using new DT format, main_conf regmap with offset 0x%x, size 0x%x\n",
+		 offset, size);
+
+	return io_ctrl;
+}
+
 static int get_parent_dss_vp(struct device_node *oldi_tx, u32 *parent_vp)
 {
 	struct device_node *ep, *dss_port;
@@ -571,11 +713,10 @@ static int tidss_oldi_probe(struct auxiliary_device *auxdev,
 	 */
 	if (link_type != OLDI_MODE_SECONDARY_DUAL_LINK &&
 	    link_type != OLDI_MODE_SECONDARY_CLONE_SINGLE_LINK) {
-		oldi->io_ctrl = syscon_regmap_lookup_by_phandle(node,
-								"ti,oldi-io-ctrl");
+		oldi->io_ctrl = get_oldi_io_ctrl_regmap(dev, node);
 		if (IS_ERR(oldi->io_ctrl)) {
 			ret = dev_err_probe(oldi->dev, PTR_ERR(oldi->io_ctrl),
-					    "OLDI%u: syscon_regmap_lookup_by_phandle failed.\n",
+					    "OLDI%u: Failed to get OLDI IO control regmap.\n",
 					    oldi_instance);
 			goto err_put_node;
 		}
@@ -637,6 +778,8 @@ static void tidss_oldi_remove(struct auxiliary_device *auxdev)
 
 		tidss->is_ext_vp_clk[oldi->parent_vp] = false;
 	}
+
+	/* io_ctrl cleanup handled automatically by devm */
 }
 
 static const struct auxiliary_device_id tidss_oldi_aux_id_table[] = {
