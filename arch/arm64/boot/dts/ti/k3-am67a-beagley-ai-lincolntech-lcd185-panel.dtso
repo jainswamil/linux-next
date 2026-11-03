@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/**
+ * Lincoln tech Solutions OLDI panel (LCD185-101CT) and touch DT overlay for AM67A-BeagleY-AI
+ *
+ * This overlay adds support for the Lincoln tech LCD185-101CT OLDI panel interfaced with
+ * the DSS0 display subsystem on BeagleY-AI. The panel includes capacitive touchscreen support.
+ *
+ * Copyright (C) 2026 Texas Instruments Incorporated - https://www.ti.com/
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include "k3-pinctrl.h"
+
+&{/} {
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pinctrl-names = "default";
+		pinctrl-0 = <&backlight_pins_default &backlight_en_pins_default>;
+		brightness-levels = <0 4 8 16 32 64 128 255>;
+		default-brightness-level = <6>;
+		enable-gpios = <&mcu_gpio0 11 GPIO_ACTIVE_HIGH>;
+		pwms = <&ecap0 0 20000 0>;
+	};
+
+	lcd {
+		compatible = "lincolntech,lcd185-101ct";
+		backlight = <&backlight>;
+		/*
+		 * Note that the OLDI TX 0 transmits the odd set of pixels
+		 * while the OLDI TX 1 transmits the even set. This is a
+		 * fixed configuration in the IP integration and is not
+		 * changeable. The properties, "dual-lvds-odd-pixels" and
+		 * "dual-lvds-even-pixels" have been used to merely
+		 * identify if a Dual Link configuration is required.
+		 * Swapping them will cause an error in the dss oldi driver.
+		 */
+		power-supply = <&vsys_5v0>;
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dual-lvds-odd-pixels;
+				lcd_in0: endpoint {
+					remote-endpoint = <&dss0_oldi0_out>;
+				};
+			};
+			port@1 {
+				reg = <1>;
+				dual-lvds-even-pixels;
+				lcd_in1: endpoint {
+					remote-endpoint = <&dss0_oldi1_out>;
+				};
+			};
+		};
+	};
+};
+
+&main_pmx0 {
+	backlight_pins_default: backlight-default-pins {
+		pinctrl-single,pins = <
+			J722S_IOPAD(0x01f0, PIN_OUTPUT, 8) /* (A23) ECAP0_IN_APWM_OUT BL_PWM */
+		>;
+	};
+
+	touchscreen_int_pins_default: touchscreen-int-default-pins {
+		pinctrl-single,pins = <
+			J722S_IOPAD(0x0038, PIN_INPUT, 7) /* (J22) GPIO0_14 TP_INT */
+		>;
+	};
+};
+
+&mcu_pmx0 {
+	backlight_en_pins_default: backlight-en-default-pins {
+		pinctrl-single,pins = <
+			J722S_MCU_IOPAD(0x002c, PIN_OUTPUT, 7) /* (C4) MCU_GPIO0_11 BL_EN */
+		>;
+	};
+
+	touchscreen_rst_pins_default: touchscreen-rst-default-pins {
+		pinctrl-single,pins = <
+			J722S_MCU_IOPAD(0x0030, PIN_OUTPUT, 7) /* (C3) MCU_GPIO0_12 MST_RST */
+		>;
+	};
+};
+
+&dss0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* VP1: Output to OLDI */
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			dss0_dpi0_out0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dss0_oldi0_in>;
+			};
+
+			dss0_dpi0_out1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dss0_oldi1_in>;
+			};
+		};
+	};
+};
+
+&dss0_oldi0 {
+	status = "okay";
+	ti,companion-oldi = <&dss0_oldi1>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+
+			dss0_oldi0_in: endpoint {
+				remote-endpoint = <&dss0_dpi0_out0>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+
+			dss0_oldi0_out: endpoint {
+				remote-endpoint = <&lcd_in0>;
+			};
+		};
+	};
+};
+
+&dss0_oldi1 {
+	status = "okay";
+	ti,secondary-oldi;
+	ti,companion-oldi = <&dss0_oldi0>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+
+			dss0_oldi1_in: endpoint {
+				remote-endpoint = <&dss0_dpi0_out1>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+
+			dss0_oldi1_out: endpoint {
+				remote-endpoint = <&lcd_in1>;
+			};
+		};
+	};
+};
+
+&main_i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&main_i2c1_pins_default>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	eeprom@57 {
+		compatible = "atmel,24c256";
+		reg = <0x57>;
+	};
+
+	touchscreen@5d {
+		compatible = "goodix,gt928";
+		reg = <0x5d>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&touchscreen_int_pins_default &touchscreen_rst_pins_default>;
+		interrupt-parent = <&main_gpio0>;
+		interrupts = <14 IRQ_TYPE_EDGE_FALLING>;
+		irq-gpios = <&main_gpio0 14 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&mcu_gpio0 12 GPIO_ACTIVE_HIGH>;
+		touchscreen-size-x = <1920>;
+		touchscreen-size-y = <1200>;
+	};
+};
+
+&ecap0 {
+	status = "okay";
+};
